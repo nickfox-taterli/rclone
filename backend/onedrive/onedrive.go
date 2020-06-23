@@ -42,7 +42,10 @@ const (
 	minSleep                    = 10 * time.Millisecond
 	maxSleep                    = 2 * time.Second
 	decayConstant               = 2 // bigger for slower decay, exponential
-	graphURL                    = "https://graph.microsoft.com/v1.0"
+	graphAPIEndpoint            = "https://graph.microsoft.com"
+	authEndpoint                = "https://login.microsoftonline.com"
+	graphAPIEndpoint21V         = "https://microsoftgraph.chinacloudapi.cn"
+	authEndpoint21V             = "https://login.chinacloudapi.cn"
 	configDriveID               = "drive_id"
 	configDriveType             = "drive_type"
 	driveTypePersonal           = "personal"
@@ -55,17 +58,22 @@ const (
 // Globals
 var (
 	// Description of how to auth for this app for a business account
+	oauthEndpoint = &oauth2.Endpoint{
+		AuthURL:  authEndpoint + "/common/oauth2/v2.0/authorize",
+		TokenURL: authEndpoint + "/common/oauth2/v2.0/token",
+	}
+
+	oauthEndpointV21 = &oauth2.Endpoint{
+		AuthURL:  authEndpoint21V + "/common/oauth2/v2.0/authorize",
+		TokenURL: authEndpoint21V + "/common/oauth2/v2.0/token",
+	}
+
 	oauthConfig = &oauth2.Config{
-		Endpoint: oauth2.Endpoint{
-			AuthURL:  "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
-			TokenURL: "https://login.microsoftonline.com/common/oauth2/v2.0/token",
-		},
 		Scopes:       []string{"Files.Read", "Files.ReadWrite", "Files.Read.All", "Files.ReadWrite.All", "offline_access", "Sites.Read.All"},
 		ClientID:     rcloneClientID,
 		ClientSecret: obscure.MustReveal(rcloneEncryptedClientSecret),
 		RedirectURL:  oauthutil.RedirectLocalhostURL,
 	}
-
 	// QuickXorHashType is the hash.Type for OneDrive
 	QuickXorHashType hash.Type
 )
@@ -78,8 +86,29 @@ func init() {
 		Description: "Microsoft OneDrive",
 		NewFs:       NewFs,
 		Config: func(name string, m configmap.Mapper) {
+
+			opt := new(Options)
+			err := configstruct.Set(m, opt)
+			if err != nil {
+				fs.Errorf(nil, "Couldn't parse config into struct: %v", err)
+				return
+			}
+
+			graphURL := graphAPIEndpoint + "/v1.0"
+			oauthConfig.Endpoint = *oauthEndpoint
+			if opt.Is21Vianet {
+				graphURL = graphAPIEndpoint21V + "/v1.0"
+				oauthConfig.Endpoint = *oauthEndpointV21
+			}
+
+			// If the administrator is NULL, then you need to get access_token manually.
+			if opt.IsNoAdmin {
+				opt := new(Options)
+				graphURL = opt.TenantURL + "/v2.0"
+			}
+
 			ctx := context.TODO()
-			err := oauthutil.Config("onedrive", name, m, oauthConfig, nil)
+			err = oauthutil.Config("onedrive", name, m, oauthConfig, nil)
 			if err != nil {
 				log.Fatalf("Failed to configure token: %v", err)
 				return
@@ -245,6 +274,14 @@ func init() {
 			Name: config.ConfigClientSecret,
 			Help: "Microsoft App Client Secret\nLeave blank normally.",
 		}, {
+			Name:    "cnserver",
+			Default: false,
+			Help:    "OneDrive operated by 21Vianet (中国版/世纪互联).",
+		}, {
+			Name:    "noadmin",
+			Default: false,
+			Help:    "OneDrive with-out Admin.",
+		}, {
 			Name: "chunk_size",
 			Help: `Chunk size to upload files with - must be multiple of 320k (327,680 bytes).
 
@@ -252,6 +289,11 @@ Above this size files will be chunked - must be multiple of 320k (327,680 bytes)
 should not exceed 250M (262,144,000 bytes) else you may encounter \"Microsoft.SharePoint.Client.InvalidClientQueryException: The request message is too big.\"
 Note that the chunks will be buffered into memory.`,
 			Default:  defaultChunkSize,
+			Advanced: true,
+		}, {
+			Name:     "tenant_url",
+			Help:     "The ID of the tenant to use",
+			Default:  "",
 			Advanced: true,
 		}, {
 			Name:     "drive_id",
@@ -336,7 +378,10 @@ configurations.`,
 
 // Options defines the configuration for this backend
 type Options struct {
+	Is21Vianet         		bool          		 `config:"cnserver"`
+	IsNoAdmin         		bool          		 `config:"noadmin"`
 	ChunkSize               fs.SizeSuffix        `config:"chunk_size"`
+	TenantURL               string               `config:"tenant_url"`
 	DriveID                 string               `config:"drive_id"`
 	DriveType               string               `config:"drive_type"`
 	ExposeOneNoteFiles      bool                 `config:"expose_onenote_files"`
@@ -593,6 +638,17 @@ func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
 		return nil, errors.New("unable to get drive_id and drive_type - if you are upgrading from older versions of rclone, please run `rclone config` and re-configure this backend")
 	}
 
+	rootURL := graphAPIEndpoint + "/v1.0" + "/drives/" + opt.DriveID
+	oauthConfig.Endpoint = *oauthEndpoint
+	if opt.Is21Vianet {
+		rootURL = graphAPIEndpoint21V + "/v1.0" + "/me/drive"
+		oauthConfig.Endpoint = *oauthEndpointV21
+	}
+
+	if opt.IsNoAdmin {
+		rootURL = opt.TenantURL + "/v2.0" + "/drives/" + opt.DriveID
+	}
+
 	root = parsePath(root)
 	oAuthClient, ts, err := oauthutil.NewClient(name, m, oauthConfig)
 	if err != nil {
@@ -605,7 +661,7 @@ func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
 		opt:       *opt,
 		driveID:   opt.DriveID,
 		driveType: opt.DriveType,
-		srv:       rest.NewClient(oAuthClient).SetRoot(graphURL + "/drives/" + opt.DriveID),
+		srv:       rest.NewClient(oAuthClient).SetRoot(rootURL),
 		pacer:     fs.NewPacer(pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
 	}
 	f.features = (&fs.Features{
@@ -1864,7 +1920,7 @@ func newOptsCall(normalizedID string, method string, route string) (opts rest.Op
 func parseNormalizedID(ID string) (string, string, string) {
 	if strings.Index(ID, "#") >= 0 {
 		s := strings.Split(ID, "#")
-		return s[1], s[0], graphURL + "/drives"
+		return s[1], "", ""
 	}
 	return ID, "", ""
 }
